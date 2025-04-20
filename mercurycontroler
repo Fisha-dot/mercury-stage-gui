@@ -4,46 +4,23 @@ import matplotlib.pyplot as plt
 import tkinter as tk
 from tkinter import Label, Entry, Button, Canvas
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from time import sleep, time
-import threading
+from time import sleep
 import nidaqmx
 from nidaqmx.constants import AcquisitionType, READ_ALL_AVAILABLE
-import serial.tools.list_ports
-
-# 占位符类（模拟 Mercury 控制器）
-class DummyStage:
-    def __init__(self):
-        self.positions = [0.0, 0.0]
-
-    def GetPos(self, iChan):
-        return self.positions[iChan]
-
-    def MoveTo(self, iChan, fPos):
-        print(f"Moving channel {iChan} to {fPos:.3f}")
-        self.positions[iChan] = fPos
-        sleep(0.1)
+from PYME.Acquire.Hardware.Mercury import mercuryStepper
 
 class MotorControlGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title('Stage Control GUI')
+        self.root.title('Mercury Stage Control')
 
-        try:
-            from PYME.Acquire.Hardware.Mercury import mercuryStepper
-            self.my_stage = mercuryStepper.mercuryStepper(comPort=4, axes=['A', 'C'], steppers=['M-505.2DG', 'M-505.2DG'])
-        except Exception as e:
-            print("Mercury controller not found or module missing. Using dummy stage.")
-            self.my_stage = DummyStage()
+        # Mercury Stage Initialization
+        self.my_stage = mercuryStepper.mercuryStepper(comPort=4, axes=['A', 'C'], steppers=['M-505.2DG', 'M-505.2DG'])
 
         Label(root, text='Step Size:').grid(row=0, column=0)
         self.step_input = Entry(root)
         self.step_input.grid(row=0, column=1)
         self.step_input.insert(0, '0.1')
-
-        Label(root, text='Search Range (±):').grid(row=0, column=2)
-        self.range_input = Entry(root)
-        self.range_input.grid(row=0, column=3)
-        self.range_input.insert(0, '0.05')
 
         Button(root, text='Move X Positive', command=lambda: self.move_motor(0, float(self.step_input.get()))).grid(row=1, column=0)
         Button(root, text='Move X Negative', command=lambda: self.move_motor(0, -float(self.step_input.get()))).grid(row=1, column=1)
@@ -54,39 +31,32 @@ class MotorControlGUI:
         Button(root, text='Optimize Position', command=self.optimize_position).grid(row=3, column=0, columnspan=2)
 
         self.result_label = Label(root, text='')
-        self.result_label.grid(row=4, column=0, columnspan=4)
+        self.result_label.grid(row=4, column=0, columnspan=2)
 
-        self.position_label = Label(root, text='Current Position: X=0.000, Y=0.000')
-        self.position_label.grid(row=5, column=0, columnspan=4)
-
-        self.time_history = []
-        self.signal_history = []
-        self.start_time = time()
+        self.wavelengths = np.linspace(750, 800, 50)
+        self.signal_values = [self.measure_signal() for _ in self.wavelengths]
 
         self.fig, self.ax = plt.subplots()
-        self.ax.set_xlabel("Time (s)")
+        self.ax.set_xlabel("Wavelength (nm)")
         self.ax.set_ylabel("Signal Strength")
-        self.line, = self.ax.plot([], [], 'b-')
+        self.line, = self.ax.plot(self.wavelengths, self.signal_values, 'b-')
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=root)
-        self.canvas.get_tk_widget().grid(row=6, column=0, columnspan=4)
-
-        self.running = True
-        threading.Thread(target=self.update_signal_plot, daemon=True).start()
-        threading.Thread(target=self.update_position_display, daemon=True).start()
+        self.canvas.get_tk_widget().grid(row=5, column=0, columnspan=2)
+        self.update_plot()
 
     def move_motor(self, chan, step):
         try:
             current_pos = self.my_stage.GetPos(iChan=chan)
             self.my_stage.MoveTo(iChan=chan, fPos=current_pos + step)
+            sleep(0.1)
             new_pos = self.my_stage.GetPos(iChan=chan)
             self.result_label.config(text=f"Channel {chan} moved to: {new_pos:.3f}")
         except Exception as e:
             self.result_label.config(text=f"Error: {str(e)}")
 
-    def optimize_position(self, learning_rate=0.01, max_iterations=10):
+    def optimize_position(self, learning_rate=0.1, max_iterations=10):
         try:
-            search_range = float(self.range_input.get())
             current_x = self.my_stage.GetPos(iChan=0)
             current_y = self.my_stage.GetPos(iChan=1)
             best_x, best_y = current_x, current_y
@@ -99,14 +69,13 @@ class MotorControlGUI:
                 current_x += learning_rate * grad_x
                 current_y += learning_rate * grad_y
 
-                current_x = max(best_x - search_range, min(best_x + search_range, current_x))
-                current_y = max(best_y - search_range, min(best_y + search_range, current_y))
-
                 self.my_stage.MoveTo(iChan=0, fPos=current_x)
                 self.my_stage.MoveTo(iChan=1, fPos=current_y)
                 sleep(0.1)
 
                 new_signal = self.measure_signal()
+                self.signal_values = [self.measure_signal() for _ in self.wavelengths]
+                self.update_plot()
                 if new_signal > best_signal:
                     best_signal = new_signal
                     best_x, best_y = current_x, current_y
@@ -134,32 +103,11 @@ class MotorControlGUI:
     def measure_signal_at(self, x, y):
         return self.measure_signal() - ((x**2 + y**2) / 100)
 
-    def update_signal_plot(self):
-        while self.running:
-            current_time = time() - self.start_time
-            signal = self.measure_signal()
-            self.time_history.append(current_time)
-            self.signal_history.append(signal)
-
-            if len(self.time_history) > 200:
-                self.time_history.pop(0)
-                self.signal_history.pop(0)
-
-            self.line.set_data(self.time_history, self.signal_history)
-            self.ax.relim()
-            self.ax.autoscale_view()
-            self.canvas.draw()
-            sleep(1)
-
-    def update_position_display(self):
-        while self.running:
-            try:
-                x = self.my_stage.GetPos(iChan=0)
-                y = self.my_stage.GetPos(iChan=1)
-                self.position_label.config(text=f"Current Position: X={x:.3f}, Y={y:.3f}")
-            except:
-                pass
-            sleep(1)
+    def update_plot(self):
+        self.line.set_ydata(self.signal_values)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.canvas.draw()
 
 if __name__ == '__main__':
     root = tk.Tk()
